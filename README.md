@@ -1,4 +1,4 @@
-# Swarm Robotics — JST RC Car Platform
+# JST RC Car Platform
 
 ESP32-based RC car platform with IMU + encoder telemetry, real-time camera streaming, and PC control via WiFi (UDP/TCP).
 
