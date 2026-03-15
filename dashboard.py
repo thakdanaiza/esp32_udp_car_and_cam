@@ -95,8 +95,6 @@ def udp_receiver(buf):
             pass
 
 
-tele_buffer = None
-
 # ---------------------------------------------------------------------------
 # CSV loading (csv mode)
 # ---------------------------------------------------------------------------
@@ -402,6 +400,10 @@ if not live_mode:
 # Layout — Live mode (dynamic callbacks)
 # ---------------------------------------------------------------------------
 else:
+    tele_buffer = TelemetryBuffer(max_entries=10 * 60 * 25)
+    threading.Thread(target=udp_receiver, args=(tele_buffer,), daemon=True).start()
+    print(f"LIVE MODE — Listening for telemetry on UDP port {UDP_TELE_PORT}")
+
     app.layout = html.Div([
         # Header with LIVE badge
         html.Div([
@@ -414,6 +416,28 @@ else:
                 "borderRadius": "4px", "fontSize": "12px", "marginLeft": "12px",
                 "fontWeight": "700", "fontFamily": "JetBrains Mono, monospace",
             }),
+            html.Div([
+                html.Span("Window:", style={
+                    "fontSize": "11px", "color": TEXT_DIM, "marginRight": "8px",
+                    "fontFamily": "JetBrains Mono, monospace",
+                }),
+                dcc.Dropdown(
+                    id="window-selector",
+                    options=[
+                        {"label": "10s", "value": 10},
+                        {"label": "30s", "value": 30},
+                        {"label": "1m", "value": 60},
+                        {"label": "2m", "value": 120},
+                        {"label": "5m", "value": 300},
+                        {"label": "10m", "value": 600},
+                    ],
+                    value=60,
+                    clearable=False,
+                    searchable=False,
+                    style={"width": "90px", "fontSize": "12px",
+                           "fontFamily": "JetBrains Mono, monospace"},
+                ),
+            ], style={"display": "flex", "alignItems": "center", "marginLeft": "auto"}),
         ], style={"padding": "20px 28px 10px 28px", "display": "flex", "alignItems": "center"}),
 
         # KPI cards (updated by callback)
@@ -443,12 +467,20 @@ else:
 
     # -- Callbacks ----------------------------------------------------------
 
+    def _filter_window(snap, window_s):
+        """Keep only the last `window_s` seconds of data."""
+        if snap.empty:
+            return snap
+        t_max = snap["time_s"].max()
+        return snap[snap["time_s"] >= t_max - window_s].reset_index(drop=True)
+
     @app.callback(
         Output("timeseries-graph", "figure"),
         Input("live-interval", "n_intervals"),
+        Input("window-selector", "value"),
     )
-    def update_timeseries(_n):
-        snap = tele_buffer.snapshot()
+    def update_timeseries(_n, window_s):
+        snap = _filter_window(tele_buffer.snapshot(), window_s)
         if snap.empty:
             return empty_figure(900)
         return build_timeseries_fig(snap, has_control_cols=False)
@@ -456,9 +488,10 @@ else:
     @app.callback(
         Output("gforce-graph", "figure"),
         Input("live-interval", "n_intervals"),
+        Input("window-selector", "value"),
     )
-    def update_gforce(_n):
-        snap = tele_buffer.snapshot()
+    def update_gforce(_n, window_s):
+        snap = _filter_window(tele_buffer.snapshot(), window_s)
         if snap.empty:
             return empty_figure(450)
         return build_gforce_fig(snap)
@@ -466,9 +499,10 @@ else:
     @app.callback(
         Output("kpi-container", "children"),
         Input("live-interval", "n_intervals"),
+        Input("window-selector", "value"),
     )
-    def update_kpis(_n):
-        snap = tele_buffer.snapshot()
+    def update_kpis(_n, window_s):
+        snap = _filter_window(tele_buffer.snapshot(), window_s)
         if snap.empty:
             return [
                 kpi_card("--", "Max Wheel RPM", TEXT_DIM),
@@ -491,10 +525,5 @@ else:
 # Run
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    if live_mode:
-        tele_buffer = TelemetryBuffer(max_entries=LIVE_WINDOW_SECONDS * 25)
-        t = threading.Thread(target=udp_receiver, args=(tele_buffer,), daemon=True)
-        t.start()
-        print(f"LIVE MODE — Listening for telemetry on UDP port {UDP_TELE_PORT}")
     print(f"Dashboard ready → http://localhost:8050")
     app.run(debug=False, port=8050)
