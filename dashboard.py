@@ -95,8 +95,6 @@ def udp_receiver(buf):
             pass
 
 
-tele_buffer = None
-
 # ---------------------------------------------------------------------------
 # CSV loading (csv mode)
 # ---------------------------------------------------------------------------
@@ -402,6 +400,10 @@ if not live_mode:
 # Layout — Live mode (dynamic callbacks)
 # ---------------------------------------------------------------------------
 else:
+    tele_buffer = TelemetryBuffer(max_entries=LIVE_WINDOW_SECONDS * 25)
+    threading.Thread(target=udp_receiver, args=(tele_buffer,), daemon=True).start()
+    print(f"LIVE MODE — Listening for telemetry on UDP port {UDP_TELE_PORT}")
+
     app.layout = html.Div([
         # Header with LIVE badge
         html.Div([
@@ -491,10 +493,5 @@ else:
 # Run
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    if live_mode:
-        tele_buffer = TelemetryBuffer(max_entries=LIVE_WINDOW_SECONDS * 25)
-        t = threading.Thread(target=udp_receiver, args=(tele_buffer,), daemon=True)
-        t.start()
-        print(f"LIVE MODE — Listening for telemetry on UDP port {UDP_TELE_PORT}")
     print(f"Dashboard ready → http://localhost:8050")
     app.run(debug=False, port=8050)
