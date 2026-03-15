@@ -20,7 +20,7 @@ import cv2
 import time
 
 # ===== Config =====
-ESP32_IP        = "192.168.x.x"  # <-- Enter the IP address of the ESP32
+ESP32_IP        = "192.168.1.31"  # <-- Enter the IP address of the ESP32
 TCP_PORT        = 8080
 INIT_QUALITY    = 12              # quality at startup (1=best, 63=worst)
 RECONNECT_DELAY = 2.0
