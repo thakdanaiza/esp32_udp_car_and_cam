@@ -4,9 +4,11 @@
 typedef struct {
   int16_t throttle;   // -1000 .. +1000
   int16_t steering;   // -1000 .. +1000
-  int16_t brake;      // -1000 .. +1000
-  bool N_but;
-  bool R_but;
+  // int16_t brake;      // -1000 .. +1000
+  // int8_t R_but;
+  // int8_t N_but;
+  // int8_t paddle_up;
+  // int8_t paddle_down;
 } ControlPacket;
 
 
@@ -29,17 +31,6 @@ const uint32_t TX_INTERVAL_MS = 50;
 uint32_t lastTxTime = 0;
 
 uint32_t lastTx = 0;
-
-int16_t mapByteSteer(int v) {
-  // v: 0..255  →  -1000..+1000
-  v = constrain(v, 0, 255);
-  return map(v, 0, 255, 75, 125);
-}
-
-int16_t mapByteThrot(int v) {
-  v = constrain(v, 0, 255);
-  return map(v, 0, 255, 1500, 1750);
-}
 
 void onReceive(const esp_now_recv_info_t *info,
                const uint8_t *data,
@@ -82,25 +73,35 @@ void loop() {
     cmd.trim();
 
     if (cmd.startsWith("<") && cmd.endsWith(">")) {
-      cmd = cmd.substring(1, cmd.length() - 1);
+      cmd = cmd.substring(1, cmd.length() - 1); // cut the <>
 
-      int commaIdx = cmd.indexOf(',');
-      if (commaIdx > 0) {
-        int steeringRaw = cmd.substring(0, commaIdx).toInt();
-        int throttleRaw = cmd.substring(commaIdx + 1).toInt();
+      int comma_1 = cmd.indexOf(',');
+      if (comma_1 > 0) {
+        int steeringRaw = cmd.substring(0, comma_1).toInt();
+        // int comma_2 = cmd.indexOf(',' ,comma_1 + 1);
+        // int throttleRaw = cmd.substring(comma_1 + 1, comma_2).toInt();
+        int throttleRaw = cmd.substring(comma_1 + 1).toInt();
+        // int comma_3 = cmd.indexOf(',' ,comma_2 + 1);
+        // int brakeRaw = cmd.substring(comma_2 + 1, comma_3).toInt();
 
-        pkt.steering = mapByteSteer(steeringRaw);
-        pkt.throttle = mapByteThrot(throttleRaw);
+        // int R_but = cmd.substring(comma_3 + 1).toInt();
+        // int N_but = cmd.substring(comma_3 + 3).toInt();
+        // int paddle_up = cmd.substring(comma_3 + 5).toInt();
+        // int paddle_down = cmd.substring(comma_3 + 7).toInt();
 
-        // esp_now_send(
-        //   broadcastAddr,
-        //   (uint8_t*)&pkt,
-        //   sizeof(pkt)
-        // );
+        pkt.steering = steeringRaw;
+        pkt.throttle = throttleRaw;
+        // pkt.brake = brakeRaw;
+        // pkt.R_but = R_but;
+        // pkt.N_but = N_but;
+        // pkt.paddle_up = paddle_up;
+        // pkt.paddle_down = paddle_down;
+
       }
     }
   }
-  /* ---------- 2) Send ESP-NOW every 50 ms ---------- */
+
+  /* ---------- 2) ส่ง ESP-NOW ทุก ๆ 50 ms ---------- */
   if (millis() - lastTxTime >= TX_INTERVAL_MS) {
     lastTxTime = millis();
 

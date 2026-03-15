@@ -15,8 +15,8 @@
 #include "esp_camera.h"
 
 // ===== WiFi =====
-const char* WIFI_SSID = "YOUR_SSID";
-const char* WIFI_PASS = "YOUR_PASSWORD";
+const char* WIFI_SSID = "301/3_2.4G";
+const char* WIFI_PASS = "357m19smith";
 
 // ===== TCP =====
 const uint16_t TCP_PORT = 8080;

@@ -20,7 +20,7 @@ import os
 from datetime import datetime
 
 # ===== UDP Config =====
-ESP32_IP      = "192.168.x.x"
+ESP32_IP      = "192.168.1.31"
 UDP_CTRL_PORT = 5005
 UDP_TELE_PORT = 5006
 
