@@ -16,6 +16,7 @@ import threading
 ESP32_IP        = "192.168.1.31"   # <-- Enter the IP of the ESP32 (check Serial Monitor or from the connected WiFi router)
 UDP_CTRL_PORT   = 5005             # port that ESP32 receives control on
 UDP_TELE_PORT   = 5006             # port that PC receives telemetry on
+DASHBOARD_PORT  = 5007             # relay telemetry to dashboard on localhost
 
 # ===== Packet format (must match ESP32 structs, packed) =====
 # ControlPacket:   int16 throttle, int16 steering  → 4 bytes
@@ -34,6 +35,9 @@ MOZA_VENDOR_IDS = [0x346E]
 steering_min    = 16777217
 steering_max    = 33554177
 
+# ===== Relay packet format (telemetry + control) =====
+RELAY_FMT = '<ffffffffihh'   # telemetry (36 bytes) + throttle_us, steer_deg (4 bytes) = 40 bytes
+
 # ===== Telemetry state (shared with receive thread) =====
 tele_lock = threading.Lock()
 tele_data = {
@@ -42,9 +46,13 @@ tele_data = {
     "angle": 0.0, "omega": 0.0, "turns": 0
 }
 
+# ===== Control state (shared with relay) =====
+ctrl_lock = threading.Lock()
+ctrl_state = {"throttle_us": 1500, "steer_deg": 100}
 
-def tele_recv_thread(sock):
-    """Background thread: receive TelemetryPacket from ESP32."""
+
+def tele_recv_thread(sock, relay_sock):
+    """Background thread: receive TelemetryPacket from ESP32 and relay to dashboard."""
     while True:
         try:
             data, _ = sock.recvfrom(256)
@@ -60,6 +68,14 @@ def tele_recv_thread(sock):
                     tele_data["angle"] = vals[6]
                     tele_data["omega"] = vals[7]
                     tele_data["turns"] = vals[8]
+                try:
+                    with ctrl_lock:
+                        thr = ctrl_state["throttle_us"]
+                        steer = ctrl_state["steer_deg"]
+                    relay_pkt = data + struct.pack('<hh', thr, steer)
+                    relay_sock.sendto(relay_pkt, ("127.0.0.1", DASHBOARD_PORT))
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -175,6 +191,9 @@ def read_device(device_info, ctrl_sock):
                 # map 0-255 throttle → ESC microseconds (1500-1750)
                 thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
                 pkt = struct.pack(CTRL_FMT, thr_us, steer_servo)
+                with ctrl_lock:
+                    ctrl_state["throttle_us"] = thr_us
+                    ctrl_state["steer_deg"] = steer_servo
                 try:
                     ctrl_sock.sendto(pkt, (ESP32_IP, UDP_CTRL_PORT))
                 except Exception:
@@ -208,8 +227,11 @@ def main():
     tele_sock.bind(("", UDP_TELE_PORT))
     tele_sock.settimeout(1.0)
 
+    # Relay socket for forwarding telemetry to dashboard
+    relay_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
     # Start receive thread
-    t = threading.Thread(target=tele_recv_thread, args=(tele_sock,), daemon=True)
+    t = threading.Thread(target=tele_recv_thread, args=(tele_sock, relay_sock), daemon=True)
     t.start()
 
     # Find Moza HID

@@ -19,11 +19,15 @@ from dash import Dash, html, dcc, Output, Input
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-UDP_TELE_PORT = 5006
+UDP_TELE_PORT = 5006       # direct from ESP32
+UDP_RELAY_PORT = 5007      # relayed from py_udp.py
 TELE_FMT = '<ffffffffi'
 TELE_SIZE = struct.calcsize(TELE_FMT)  # 36
+RELAY_FMT = '<ffffffffihh'             # telemetry + throttle_us + steer_deg
+RELAY_SIZE = struct.calcsize(RELAY_FMT) # 40
 LIVE_WINDOW_SECONDS = 60
-LIVE_UPDATE_MS = 200
+LIVE_UPDATE_MS = 200  # 5 Hz dashboard refresh
+SHOW_GFORCE = False
 
 # Color palette
 BG = "#0d1117"
@@ -55,22 +59,32 @@ live_mode = "--live" in sys.argv
 # ---------------------------------------------------------------------------
 
 class TelemetryBuffer:
-    def __init__(self, max_entries=1500):
+    def __init__(self, window_s=60):
         self._lock = threading.Lock()
-        self._buf = deque(maxlen=max_entries)
+        self._buf = deque()
         self._t0 = None
+        self.window_s = window_s
 
     def append(self, vals):
         with self._lock:
             now = time.time()
             if self._t0 is None:
                 self._t0 = now
-            self._buf.append({
-                "time_s": round(now - self._t0, 4),
+            t = round(now - self._t0, 4)
+            entry = {
+                "time_s": t,
                 "ax": vals[0], "ay": vals[1], "az": vals[2],
                 "gx": vals[3], "gy": vals[4], "gz": vals[5],
                 "angle_deg": vals[6], "omega_deg_s": vals[7], "turn_counts": vals[8],
-            })
+            }
+            if len(vals) >= 11:
+                entry["throttle_us"] = vals[9]
+                entry["steer_deg"] = vals[10]
+            self._buf.append(entry)
+            # Trim old data outside window
+            cutoff = t - self.window_s
+            while self._buf and self._buf[0]["time_s"] < cutoff:
+                self._buf.popleft()
 
     def snapshot(self):
         with self._lock:
@@ -82,12 +96,15 @@ class TelemetryBuffer:
 def udp_receiver(buf):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("", UDP_TELE_PORT))
+    port = UDP_RELAY_PORT if live_mode else UDP_TELE_PORT
+    sock.bind(("", port))
     sock.settimeout(1.0)
     while True:
         try:
             data, _ = sock.recvfrom(256)
-            if len(data) == TELE_SIZE:
+            if len(data) == RELAY_SIZE:
+                buf.append(struct.unpack(RELAY_FMT, data))
+            elif len(data) == TELE_SIZE:
                 buf.append(struct.unpack(TELE_FMT, data))
         except socket.timeout:
             pass
@@ -298,6 +315,80 @@ def build_gforce_fig(dataframe):
     return gfig
 
 
+def build_steering_wheel_fig(steer_deg=100):
+    """Build a steering wheel visualization. steer_deg: 75 (left) - 100 (center) - 125 (right)."""
+    # Map servo 75-125 → visual rotation ±90°
+    rotation_deg = (steer_deg - 100) / 25 * 90
+    angle_rad = np.radians(-rotation_deg)  # negative so clockwise = right
+
+    fig = go.Figure()
+
+    # Outer rim
+    theta = np.linspace(0, 2 * np.pi, 120)
+    rim_r = 1.0
+    fig.add_trace(go.Scatter(
+        x=rim_r * np.cos(theta), y=rim_r * np.sin(theta),
+        mode="lines", line=dict(color=CYAN, width=4),
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # Three spokes at 120° apart, rotated
+    spoke_len = 0.75
+    for base_angle in [np.pi / 2, np.pi / 2 + 2 * np.pi / 3, np.pi / 2 + 4 * np.pi / 3]:
+        a = base_angle + angle_rad
+        fig.add_trace(go.Scatter(
+            x=[0, spoke_len * np.cos(a)], y=[0, spoke_len * np.sin(a)],
+            mode="lines", line=dict(color=TEXT, width=3),
+            showlegend=False, hoverinfo="skip",
+        ))
+
+    # Center hub
+    hub_theta = np.linspace(0, 2 * np.pi, 60)
+    hub_r = 0.18
+    fig.add_trace(go.Scatter(
+        x=hub_r * np.cos(hub_theta), y=hub_r * np.sin(hub_theta),
+        mode="lines", fill="toself", fillcolor=CARD_BG,
+        line=dict(color=TEXT, width=2),
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # Top marker (fixed reference)
+    fig.add_trace(go.Scatter(
+        x=[0], y=[1.2],
+        mode="markers", marker=dict(symbol="triangle-down", size=14, color=RED),
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # Direction label
+    if rotation_deg < -2:
+        direction = "LEFT"
+        dir_color = CYAN
+    elif rotation_deg > 2:
+        direction = "RIGHT"
+        dir_color = ORANGE
+    else:
+        direction = "CENTER"
+        dir_color = GREEN
+
+    fig.update_layout(
+        **LAYOUT_COMMON,
+        height=320,
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(visible=False, range=[-1.5, 1.5], scaleanchor="y", scaleratio=1),
+        yaxis=dict(visible=False, range=[-1.5, 1.5]),
+        showlegend=False,
+        annotations=[
+            dict(text=f"{steer_deg}°", x=0, y=0, showarrow=False,
+                 font=dict(size=16, color=TEXT, family="JetBrains Mono, monospace")),
+            dict(text=direction, x=0, y=-1.35, showarrow=False,
+                 font=dict(size=13, color=dir_color, family="JetBrains Mono, monospace",
+                           weight="bold")),
+        ],
+        uirevision="constant",
+    )
+    return fig
+
+
 def empty_figure(height, message="Waiting for telemetry..."):
     fig = go.Figure()
     fig.update_layout(
@@ -364,7 +455,7 @@ if not live_mode:
 
     has_ctrl = "throttle_us" in df.columns and "steer_deg" in df.columns
     ts_fig = build_timeseries_fig(df, has_control_cols=has_ctrl)
-    gf_fig = build_gforce_fig(df)
+    gf_fig = build_gforce_fig(df) if SHOW_GFORCE else None
 
     app.layout = html.Div([
         html.Div([
@@ -389,20 +480,20 @@ if not live_mode:
             html.Div([
                 dcc.Graph(figure=ts_fig, config={"displayModeBar": True, "scrollZoom": True}),
             ], style={"flex": "3"}),
-            html.Div([
+        ] + ([html.Div([
                 html.P("G-FORCE MAP", style=gforce_label_style),
                 dcc.Graph(figure=gf_fig, config={"displayModeBar": False}),
             ], style={"flex": "1", "minWidth": "320px"}),
-        ], style={"display": "flex", "padding": "0 20px", "gap": "8px"}),
+        ] if SHOW_GFORCE else []), style={"display": "flex", "padding": "0 20px", "gap": "8px"}),
     ], style=page_style)
 
 # ---------------------------------------------------------------------------
 # Layout — Live mode (dynamic callbacks)
 # ---------------------------------------------------------------------------
 else:
-    tele_buffer = TelemetryBuffer(max_entries=10 * 60 * 25)
+    tele_buffer = TelemetryBuffer(window_s=LIVE_WINDOW_SECONDS)
     threading.Thread(target=udp_receiver, args=(tele_buffer,), daemon=True).start()
-    print(f"LIVE MODE — Listening for telemetry on UDP port {UDP_TELE_PORT}")
+    print(f"LIVE MODE — Listening for telemetry on UDP port {UDP_RELAY_PORT} (relayed from py_udp.py)")
 
     app.layout = html.Div([
         # Header with LIVE badge
@@ -461,14 +552,18 @@ else:
         # Graphs
         html.Div([
             html.Div([
-                dcc.Graph(id="timeseries-graph", figure=empty_figure(900),
+                dcc.Graph(id="timeseries-graph", figure=empty_figure(1100),
                           config={"displayModeBar": True, "scrollZoom": True}),
             ], style={"flex": "3"}),
             html.Div([
+                html.P("STEERING", style=gforce_label_style),
+                dcc.Graph(id="steering-wheel", figure=build_steering_wheel_fig(100),
+                          config={"displayModeBar": False, "staticPlot": True}),
+            ] + ([
                 html.P("G-FORCE MAP", style=gforce_label_style),
                 dcc.Graph(id="gforce-graph", figure=empty_figure(450),
                           config={"displayModeBar": False}),
-            ], style={"flex": "1", "minWidth": "320px"}),
+            ] if SHOW_GFORCE else []), style={"flex": "1", "minWidth": "320px"}),
         ], style={"display": "flex", "padding": "0 20px", "gap": "8px"}),
 
         # Interval timer
@@ -477,42 +572,46 @@ else:
 
     # -- Callbacks ----------------------------------------------------------
 
-    def _filter_window(snap, window_s):
-        """Keep only the last `window_s` seconds of data."""
-        if snap.empty:
-            return snap
-        t_max = snap["time_s"].max()
-        return snap[snap["time_s"] >= t_max - window_s].reset_index(drop=True)
-
     @app.callback(
         Output("timeseries-graph", "figure"),
         Input("live-interval", "n_intervals"),
         Input("window-selector", "value"),
     )
     def update_timeseries(_n, window_s):
-        snap = _filter_window(tele_buffer.snapshot(), window_s)
+        tele_buffer.window_s = window_s
+        snap = tele_buffer.snapshot()
         if snap.empty:
             return empty_figure(900)
-        return build_timeseries_fig(snap, has_control_cols=False)
+        has_ctrl = "throttle_us" in snap.columns and "steer_deg" in snap.columns
+        return build_timeseries_fig(snap, has_control_cols=has_ctrl)
+
+    if SHOW_GFORCE:
+        @app.callback(
+            Output("gforce-graph", "figure"),
+            Input("live-interval", "n_intervals"),
+        )
+        def update_gforce(_n):
+            snap = tele_buffer.snapshot()
+            if snap.empty:
+                return empty_figure(450)
+            return build_gforce_fig(snap)
 
     @app.callback(
-        Output("gforce-graph", "figure"),
+        Output("steering-wheel", "figure"),
         Input("live-interval", "n_intervals"),
-        Input("window-selector", "value"),
     )
-    def update_gforce(_n, window_s):
-        snap = _filter_window(tele_buffer.snapshot(), window_s)
-        if snap.empty:
-            return empty_figure(450)
-        return build_gforce_fig(snap)
+    def update_steering(_n):
+        snap = tele_buffer.snapshot()
+        if snap.empty or "steer_deg" not in snap.columns:
+            return build_steering_wheel_fig(100)
+        return build_steering_wheel_fig(int(snap["steer_deg"].iloc[-1]))
 
     @app.callback(
         Output("kpi-container", "children"),
         Input("live-interval", "n_intervals"),
-        Input("window-selector", "value"),
     )
-    def update_kpis(_n, window_s):
-        snap = _filter_window(tele_buffer.snapshot(), window_s)
+    def update_kpis(_n):
+        snap = tele_buffer.snapshot()
         if snap.empty:
             return [
                 kpi_card("--", "Max Wheel RPM", TEXT_DIM),
