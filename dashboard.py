@@ -418,10 +418,10 @@ else:
             }),
             html.Div([
                 html.Span("Window:", style={
-                    "fontSize": "11px", "color": TEXT_DIM, "marginRight": "8px",
+                    "fontSize": "11px", "color": TEXT_DIM, "marginRight": "10px",
                     "fontFamily": "JetBrains Mono, monospace",
                 }),
-                dcc.Dropdown(
+                dcc.RadioItems(
                     id="window-selector",
                     options=[
                         {"label": "10s", "value": 10},
@@ -432,10 +432,20 @@ else:
                         {"label": "10m", "value": 600},
                     ],
                     value=60,
-                    clearable=False,
-                    searchable=False,
-                    style={"width": "90px", "fontSize": "12px",
-                           "fontFamily": "JetBrains Mono, monospace"},
+                    inline=True,
+                    inputStyle={"display": "none"},
+                    labelStyle={
+                        "display": "inline-block",
+                        "padding": "4px 10px",
+                        "margin": "0 3px",
+                        "borderRadius": "4px",
+                        "fontSize": "11px",
+                        "color": TEXT_DIM,
+                        "backgroundColor": CARD_BG,
+                        "border": f"1px solid {BORDER}",
+                        "cursor": "pointer",
+                        "fontFamily": "JetBrains Mono, monospace",
+                    },
                 ),
             ], style={"display": "flex", "alignItems": "center", "marginLeft": "auto"}),
         ], style={"padding": "20px 28px 10px 28px", "display": "flex", "alignItems": "center"}),
