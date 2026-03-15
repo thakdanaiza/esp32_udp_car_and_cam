@@ -90,6 +90,10 @@ void applyQuality(uint8_t q) {
   if (q == jpegQuality) return;
   jpegQuality = q;
   sensor_t* s = esp_camera_sensor_get();
+  if (!s) {
+    Serial.println("Sensor not ready");
+    return;
+  }
   s->set_quality(s, jpegQuality);
   Serial.printf("Quality → %d\n", jpegQuality);
 }

@@ -49,7 +49,7 @@ uint32_t frameCount  = 0;
 uint32_t lastFpsTime = 0;
 
 bool initCamera() {
-  camera_config_t config;
+  camera_config_t config = {};   // zero-init all fields
   config.ledc_channel  = LEDC_CHANNEL_0;
   config.ledc_timer    = LEDC_TIMER_0;
   config.pin_d0        = CAM_PIN_D0;
