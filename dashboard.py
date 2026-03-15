@@ -27,7 +27,7 @@ RELAY_FMT = '<ffffffffihh'             # telemetry + throttle_us + steer_deg
 RELAY_SIZE = struct.calcsize(RELAY_FMT) # 40
 LIVE_WINDOW_SECONDS = 60
 LIVE_UPDATE_MS = 200  # 5 Hz dashboard refresh
-SHOW_GFORCE = False
+SHOW_GFORCE = True
 
 # Color palette
 BG = "#0d1117"
