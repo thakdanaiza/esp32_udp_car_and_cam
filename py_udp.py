@@ -42,7 +42,7 @@ accel_cmd = 0.0
 vel_cmd = 0.0
 
 # ===== Relay packet format (telemetry + control) =====
-RELAY_FMT = '<ffffffffihh'   # telemetry (36 bytes) + throttle_us, steer_deg (4 bytes) = 40 bytes
+RELAY_FMT = '<ffffffffihhh'  # telemetry (36 bytes) + throttle_us, steer_deg, gear (6 bytes) = 42 bytes
 
 # ===== Telemetry state (shared with receive thread) =====
 tele_lock = threading.Lock()
@@ -54,7 +54,7 @@ tele_data = {
 
 # ===== Control state (shared with relay) =====
 ctrl_lock = threading.Lock()
-ctrl_state = {"throttle_us": 1500, "steer_deg": 100}
+ctrl_state = {"throttle_us": 1500, "steer_deg": 100, "gear": 0}
 
 # ===== Relay counter (shared with display) =====
 relay_lock = threading.Lock()
@@ -84,7 +84,8 @@ def tele_recv_thread(sock, relay_sock):
                     with ctrl_lock:
                         thr   = ctrl_state["throttle_us"]
                         steer = ctrl_state["steer_deg"]
-                    relay_pkt = data + struct.pack('<hh', int(thr), int(steer))
+                        gear  = ctrl_state["gear"]
+                    relay_pkt = data + struct.pack('<hhh', int(thr), int(steer), int(gear))
                     relay_sock.sendto(relay_pkt, ("127.0.0.1", DASHBOARD_PORT))
                     with relay_lock:
                         relay_count += 1
@@ -299,6 +300,7 @@ def read_device(device_info, ctrl_sock):
                 with ctrl_lock:
                     ctrl_state["throttle_us"] = int(thr_us)
                     ctrl_state["steer_deg"] = steer_servo
+                    ctrl_state["gear"] = gear
                 try:
                     ctrl_sock.sendto(pkt, (ESP32_IP, UDP_CTRL_PORT))
                 except Exception as e:
