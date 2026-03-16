@@ -22,7 +22,7 @@ import time
 # ===== Config =====
 ESP32_IP        = "192.168.1.17"  # <-- Enter the IP address of the ESP32
 TCP_PORT        = 8080
-INIT_QUALITY    = 12              # quality at startup (1=best, 63=worst)
+INIT_QUALITY    = 48              # quality at startup (1=best, 63=worst)
 RECONNECT_DELAY = 2.0
 
 WINDOW = "ESP32-CAM 720p  |  Q=quit"
@@ -60,9 +60,14 @@ def on_trackbar(val):
 def recv_exact(sock, n):
     buf = bytearray()
     while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
+        try:
+            chunk = sock.recv(n - len(buf))
+        except socket.timeout:
+            raise ConnectionError("Timeout waiting for data")
+
         if not chunk:
             raise ConnectionError("Connection closed")
+
         buf.extend(chunk)
     return bytes(buf)
 
@@ -79,7 +84,9 @@ def stream_loop(sock):
 
     while True:
         # Read header
+        print("Waiting frame...")
         header = recv_exact(sock, 4)
+        print("Header received")
         size   = struct.unpack('>I', header)[0]
 
         if size == 0 or size > 300_000:
@@ -91,6 +98,8 @@ def stream_loop(sock):
         # Decode
         arr = np.frombuffer(jpeg, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if len(jpeg) < 1000:
+            continue
         if img is None:
             continue
 

@@ -76,9 +76,13 @@ bool initCamera() {
   config.pixel_format  = PIXFORMAT_JPEG;
 
   if (psramFound()) {
-    config.frame_size   = FRAMESIZE_HD;   // 1280x720 — needs PSRAM
-    config.fb_count     = 2;
-    config.grab_mode    = CAMERA_GRAB_LATEST;
+    // config.frame_size   = FRAMESIZE_HD;   // 1280x720 — needs PSRAM
+    // config.fb_count     = 3; // was 2
+    // config.grab_mode    = CAMERA_GRAB_LATEST;
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
     Serial.println("No PSRAM — falling back to VGA");
     config.frame_size   = FRAMESIZE_VGA;  // 640x480 — safe without PSRAM
@@ -186,10 +190,10 @@ void loop() {
   if (!streaming) return;   // Quality byte not yet received → do not send
 
   // Low-heap guard — skip frame rather than crash
-  if (heap_caps_get_free_size(MALLOC_CAP_DEFAULT) < 20000) {
+  if (heap_caps_get_free_size(MALLOC_CAP_DEFAULT) < 8000) {
     Serial.printf("[MEM] Low heap: %u bytes — skipping frame\n",
                   heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
-    delay(50);
+    delay(100);
     return;
   }
 
@@ -197,8 +201,11 @@ void loop() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Frame capture failed");
+    delay(10);
     return;
   }
+
+  Serial.printf("Frame OK  size=%d\n", fb->len);
 
   bool ok = sendFrame(client, fb);
   esp_camera_fb_return(fb);
