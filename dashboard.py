@@ -8,13 +8,14 @@ import time
 import struct
 import socket
 import threading
+import base64
 from collections import deque
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from dash import Dash, html, dcc, Output, Input
+from dash import Dash, html, dcc, Output, Input, State
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -28,6 +29,14 @@ RELAY_SIZE = struct.calcsize(RELAY_FMT) # 40
 LIVE_WINDOW_SECONDS = 60
 LIVE_UPDATE_MS = 200  # 5 Hz dashboard refresh
 SHOW_GFORCE = True
+
+# Camera (chunked UDP from ESP32-CAM)
+CAM_IP = "192.168.1.17"
+CAM_CMD_PORT = 8080
+CAM_STREAM_PORT = 8081
+CAM_QUALITY = 48
+CAM_QUALITY_RESEND = 1.0
+SHOW_CAMERA = True
 
 # Color palette
 BG = "#0d1117"
@@ -91,6 +100,46 @@ class TelemetryBuffer:
             if not self._buf:
                 return pd.DataFrame()
             return pd.DataFrame(list(self._buf))
+
+
+class CameraBuffer:
+    """Thread-safe chunked-UDP JPEG reassembler (same protocol as cam_viewer.py)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._latest_jpeg = None
+        self.quality = CAM_QUALITY
+        # reassembly state
+        self._cur_frame_id = -1
+        self._cur_total = 0
+        self._cur_chunks = {}
+
+    def feed(self, data):
+        """Feed a raw UDP packet; reassemble and store completed JPEG."""
+        if len(data) < 5:
+            return
+        frame_id = struct.unpack('<H', data[:2])[0]
+        chunk_idx = data[2]
+        total_chunks = data[3]
+        payload = data[4:]
+
+        if frame_id != self._cur_frame_id:
+            self._cur_frame_id = frame_id
+            self._cur_total = total_chunks
+            self._cur_chunks = {}
+
+        self._cur_chunks[chunk_idx] = payload
+
+        if len(self._cur_chunks) == self._cur_total:
+            jpeg = b''.join(self._cur_chunks[i] for i in range(self._cur_total)
+                            if i in self._cur_chunks)
+            with self._lock:
+                self._latest_jpeg = jpeg
+            self._cur_chunks = {}
+
+    def get_latest(self):
+        with self._lock:
+            return self._latest_jpeg
 
 
 def udp_receiver(buf):
@@ -406,6 +455,37 @@ def empty_figure(height, message="Waiting for telemetry..."):
 app = Dash(__name__)
 app.title = "JST Racing Telemetry"
 
+@app.server.before_request
+def _fix_dash4_input_batching():
+    """Dash 4 client-side bug: batches inputs across co-firing callbacks.
+    Rebuild body to contain exactly the items the target callback expects."""
+    import flask as _fl
+    if _fl.request.path != '/_dash-update-component' or _fl.request.method != 'POST':
+        return
+    body = _fl.request.get_json(silent=True)
+    if not body:
+        return
+    cb = app.callback_map.get(body.get('output', ''))
+    if not cb:
+        return
+    # Single lookup from ALL sent items (client may put states in inputs or vice versa)
+    all_sent = {}
+    for i in body.get('inputs', []):
+        all_sent[(i['id'], i['property'])] = i
+    for s in body.get('state', []):
+        all_sent[(s['id'], s['property'])] = s
+    # Rebuild in callback-definition order; pad missing items so length always matches indices
+    body['inputs'] = [
+        all_sent.get((d['id'], d['property']),
+                     {'id': d['id'], 'property': d['property'], 'value': None})
+        for d in cb['inputs']
+    ]
+    body['state'] = [
+        all_sent.get((d['id'], d['property']),
+                     {'id': d['id'], 'property': d['property'], 'value': None})
+        for d in cb['state']
+    ]
+
 card_style = {
     "backgroundColor": CARD_BG,
     "border": f"1px solid {BORDER}",
@@ -495,6 +575,36 @@ else:
     threading.Thread(target=udp_receiver, args=(tele_buffer,), daemon=True).start()
     print(f"LIVE MODE — Listening for telemetry on UDP port {UDP_RELAY_PORT} (relayed from py_udp.py)")
 
+    # Camera threads
+    cam_buffer = None
+    if SHOW_CAMERA:
+        cam_buffer = CameraBuffer()
+
+        def _cam_receiver():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+            sock.bind(("", CAM_STREAM_PORT))
+            sock.settimeout(1.0)
+            while True:
+                try:
+                    data, _ = sock.recvfrom(1500)
+                    cam_buffer.feed(data)
+                except socket.timeout:
+                    pass
+                except Exception:
+                    pass
+
+        def _cam_quality_sender():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            while True:
+                q = max(1, min(63, cam_buffer.quality))
+                sock.sendto(bytes([q]), (CAM_IP, CAM_CMD_PORT))
+                time.sleep(CAM_QUALITY_RESEND)
+
+        threading.Thread(target=_cam_receiver, daemon=True).start()
+        threading.Thread(target=_cam_quality_sender, daemon=True).start()
+        print(f"CAMERA — Streaming from {CAM_IP} cmd:{CAM_CMD_PORT} stream:{CAM_STREAM_PORT}")
+
     app.layout = html.Div([
         # Header with LIVE badge
         html.Div([
@@ -555,27 +665,40 @@ else:
                 dcc.Graph(id="timeseries-graph", figure=empty_figure(1100),
                           config={"displayModeBar": True, "scrollZoom": True}),
             ], style={"flex": "3"}),
-            html.Div([
-                html.P("STEERING", style=gforce_label_style),
-                dcc.Graph(id="steering-wheel", figure=build_steering_wheel_fig(100),
-                          config={"displayModeBar": False, "staticPlot": True}),
-            ] + ([
-                html.P("G-FORCE MAP", style=gforce_label_style),
-                dcc.Graph(id="gforce-graph", figure=empty_figure(450),
-                          config={"displayModeBar": False}),
-            ] if SHOW_GFORCE else []), style={"flex": "1", "minWidth": "320px"}),
+            html.Div(
+                ([
+                    html.P("CAMERA", style=gforce_label_style),
+                    html.Img(id="camera-feed", style={
+                        "width": "100%", "borderRadius": "8px",
+                        "border": f"1px solid {BORDER}", "display": "block",
+                    }),
+                    dcc.Slider(
+                        id="cam-quality-slider", min=1, max=63, value=CAM_QUALITY, step=1,
+                        marks={1: "1 (best)", 32: "32", 63: "63 (fast)"},
+                        tooltip={"placement": "bottom"},
+                    ),
+                ] if SHOW_CAMERA else []) + [
+                    html.P("STEERING", style=gforce_label_style),
+                    dcc.Graph(id="steering-wheel", figure=build_steering_wheel_fig(100),
+                              config={"displayModeBar": False, "staticPlot": True}),
+                ] + ([
+                    html.P("G-FORCE MAP", style=gforce_label_style),
+                    dcc.Graph(id="gforce-graph", figure=empty_figure(450),
+                              config={"displayModeBar": False}),
+                ] if SHOW_GFORCE else []),
+                style={"flex": "1", "minWidth": "320px"},
+            ),
         ], style={"display": "flex", "padding": "0 20px", "gap": "8px"}),
 
-        # Interval timer
         dcc.Interval(id="live-interval", interval=LIVE_UPDATE_MS, n_intervals=0),
     ], style=page_style)
 
-    # -- Callbacks ----------------------------------------------------------
+    # -- Callbacks ----
 
     @app.callback(
         Output("timeseries-graph", "figure"),
         Input("live-interval", "n_intervals"),
-        Input("window-selector", "value"),
+        State("window-selector", "value"),
     )
     def update_timeseries(_n, window_s):
         tele_buffer.window_s = window_s
@@ -629,6 +752,21 @@ else:
             kpi_card(f"{duration:.1f}s", "Window", GOLD),
             kpi_card(f"{peak_g:.2f} G", "Peak G-Force", TEXT),
         ]
+
+    if SHOW_CAMERA:
+        @app.callback(
+            Output("camera-feed", "src"),
+            Input("live-interval", "n_intervals"),
+            State("cam-quality-slider", "value"),
+            prevent_initial_call=True,
+        )
+        def update_camera(_n, quality):
+            if quality is not None:
+                cam_buffer.quality = max(1, min(63, quality))
+            jpeg = cam_buffer.get_latest()
+            if jpeg is None:
+                return ""
+            return f"data:image/jpeg;base64,{base64.b64encode(jpeg).decode()}"
 
 # ---------------------------------------------------------------------------
 # Run
