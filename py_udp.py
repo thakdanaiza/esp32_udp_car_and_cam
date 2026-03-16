@@ -13,7 +13,7 @@ import socket
 import threading
 
 # ===== UDP Config =====
-ESP32_IP        = "192.168.1.31"   # <-- Enter the IP of the ESP32 (check Serial Monitor or from the connected WiFi router)
+ESP32_IP        = "192.168.1.12"   # <-- Enter the IP of the ESP32 (check Serial Monitor or from the connected WiFi router)
 UDP_CTRL_PORT   = 5005             # port that ESP32 receives control on
 UDP_TELE_PORT   = 5006             # port that PC receives telemetry on
 DASHBOARD_PORT  = 5007             # relay telemetry to dashboard on localhost
@@ -236,6 +236,8 @@ def read_device(device_info, ctrl_sock):
                         thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
                     case -1:
                         thr_us = int(1500 - (throttle_out / 255 * (1500 - 1250)))
+                    case 0:
+                        thr_us = 1500
                 pkt = struct.pack(CTRL_FMT, thr_us, steer_servo)
                 with ctrl_lock:
                     ctrl_state["throttle_us"] = thr_us
