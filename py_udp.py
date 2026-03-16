@@ -56,9 +56,15 @@ tele_data = {
 ctrl_lock = threading.Lock()
 ctrl_state = {"throttle_us": 1500, "steer_deg": 100}
 
+# ===== Relay counter (shared with display) =====
+relay_lock = threading.Lock()
+relay_count = 0
+relay_errors = 0
+
 
 def tele_recv_thread(sock, relay_sock):
     """Background thread: receive TelemetryPacket from ESP32 and relay to dashboard."""
+    global relay_count, relay_errors
     while True:
         try:
             data, _ = sock.recvfrom(256)
@@ -78,12 +84,18 @@ def tele_recv_thread(sock, relay_sock):
                     with ctrl_lock:
                         thr   = ctrl_state["throttle_us"]
                         steer = ctrl_state["steer_deg"]
-                    relay_pkt = data + struct.pack('<hh', thr, steer)
+                    relay_pkt = data + struct.pack('<hh', int(thr), int(steer))
                     relay_sock.sendto(relay_pkt, ("127.0.0.1", DASHBOARD_PORT))
-                except Exception:
-                    pass
-        except Exception:
+                    with relay_lock:
+                        relay_count += 1
+                except Exception as e:
+                    with relay_lock:
+                        relay_errors += 1
+                    print(f"[RELAY ERR] {e}", file=sys.stderr)
+        except socket.timeout:
             pass
+        except Exception as e:
+            print(f"[TELE RECV ERR] {e}", file=sys.stderr)
 
 
 def draw_steering_bar(value, min_val, max_val):
@@ -134,7 +146,7 @@ def read_device(device_info, ctrl_sock):
     print(f"HID connected. Sending control to {ESP32_IP}:{UDP_CTRL_PORT}")
     print(f"Receiving telemetry on port {UDP_TELE_PORT}")
     print("Press Ctrl+C to stop.\n")
-    print("\n" * 16)
+    print("\n" * 18)
 
     last_serial_send = 0
     steering_out     = 127
@@ -205,7 +217,7 @@ def read_device(device_info, ctrl_sock):
                 global pedal_prev, diff_pedal, k_g, accel_cmd, vel_cmd
 
                 # Redraw display (16 lines)
-                sys.stdout.write('\033[16F')
+                sys.stdout.write('\033[18F')
 
                 raw_disp = " ".join(f"{i}:{data[i]:3d}" for i in range(min(12, len(data))))
 
@@ -224,6 +236,9 @@ def read_device(device_info, ctrl_sock):
                 print(f"│  IMU  A [{t['ax']:6.2f} {t['ay']:6.2f} {t['az']:6.2f}]"
                       f"  G [{t['gx']:6.2f} {t['gy']:6.2f} {t['gz']:6.2f}]                            │")
                 print(f"│  ENC  deg={t['angle']:6.1f}  omega={t['omega']:7.1f} deg/s  turns={t['turns']:6d}                                 │")
+                with relay_lock:
+                    rc, re = relay_count, relay_errors
+                print(f"│  RELAY→dashboard  sent={rc}  errors={re}                                                    │")
                 print(f"│  acc:{accel_cmd}, vel:{vel_cmd}, d_p:{diff_pedal}, pedal_prev:{pedal_prev}                                 │")
                 # print("│" + " " * 85 + "│")
                 # print(f"│  Raw bytes: {raw_disp:64} │")
@@ -282,12 +297,12 @@ def read_device(device_info, ctrl_sock):
                         thr_us = 1500 + (2000 - 1500) * ((vel_cmd - 0) / (100 - 0))
                 pkt = struct.pack(CTRL_FMT, int(thr_us), steer_servo)
                 with ctrl_lock:
-                    ctrl_state["throttle_us"] = thr_us
+                    ctrl_state["throttle_us"] = int(thr_us)
                     ctrl_state["steer_deg"] = steer_servo
                 try:
                     ctrl_sock.sendto(pkt, (ESP32_IP, UDP_CTRL_PORT))
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[CTRL SEND ERR] {e}", file=sys.stderr)
                 last_serial_send = current_ms
 
             time.sleep(0.001)

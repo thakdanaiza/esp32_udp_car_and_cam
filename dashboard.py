@@ -148,17 +148,27 @@ def udp_receiver(buf):
     port = UDP_RELAY_PORT if live_mode else UDP_TELE_PORT
     sock.bind(("", port))
     sock.settimeout(1.0)
+    recv_count = 0
+    last_log = time.time()
     while True:
         try:
-            data, _ = sock.recvfrom(256)
+            data, addr = sock.recvfrom(256)
             if len(data) == RELAY_SIZE:
                 buf.append(struct.unpack(RELAY_FMT, data))
+                recv_count += 1
             elif len(data) == TELE_SIZE:
                 buf.append(struct.unpack(TELE_FMT, data))
+                recv_count += 1
+            else:
+                print(f"[DASH RECV] unexpected packet size={len(data)} from {addr}", file=sys.stderr)
+            now = time.time()
+            if now - last_log >= 5.0:
+                print(f"[DASH] received {recv_count} telemetry packets so far", file=sys.stderr)
+                last_log = now
         except socket.timeout:
             pass
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DASH RECV ERR] {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -591,8 +601,8 @@ else:
                     cam_buffer.feed(data)
                 except socket.timeout:
                     pass
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[CAM RECV ERR] {e}", file=sys.stderr)
 
         def _cam_quality_sender():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
