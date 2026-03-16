@@ -35,6 +35,12 @@ MOZA_VENDOR_IDS = [0x346E]
 steering_min    = 16777217
 steering_max    = 33554177
 
+pedal_prev = 0.0
+diff_pedal = 0.0
+k_g = [0.01, 0.1, 0.08, 0.06]
+accel_cmd = 0.0
+vel_cmd = 0.0
+
 # ===== Relay packet format (telemetry + control) =====
 RELAY_FMT = '<ffffffffihh'   # telemetry (36 bytes) + throttle_us, steer_deg (4 bytes) = 40 bytes
 
@@ -163,8 +169,6 @@ def read_device(device_info, ctrl_sock):
                     paddle_right = (data[19] >> 1) & 1
                     N_button     = (data[19] >> 6) & 1
                     R_button     = (data[21] >> 6) & 1
-                    
-                    
 
                 # Normalize to 0-255
                 s_range = steering_max - steering_min
@@ -198,6 +202,8 @@ def read_device(device_info, ctrl_sock):
                     R_flag = 1
                     gear = -1
 
+                global pedal_prev, diff_pedal, k_g, accel_cmd, vel_cmd
+
                 # Redraw display (16 lines)
                 sys.stdout.write('\033[16F')
 
@@ -218,27 +224,63 @@ def read_device(device_info, ctrl_sock):
                 print(f"│  IMU  A [{t['ax']:6.2f} {t['ay']:6.2f} {t['az']:6.2f}]"
                       f"  G [{t['gx']:6.2f} {t['gy']:6.2f} {t['gz']:6.2f}]                            │")
                 print(f"│  ENC  deg={t['angle']:6.1f}  omega={t['omega']:7.1f} deg/s  turns={t['turns']:6d}                                 │")
+                print(f"│  acc:{accel_cmd}, vel:{vel_cmd}, d_p:{diff_pedal}, pedal_prev:{pedal_prev}                                 │")
                 # print("│" + " " * 85 + "│")
                 # print(f"│  Raw bytes: {raw_disp:64} │")
                 print("└" + "─" * 85 + "┘")
 
-            # Send ControlPacket every 50ms
-            if (current_ms - last_serial_send) >= 50:
+            # Send ControlPacket every 10ms
+            if (current_ms - last_serial_send) >= 10:
                 # map 0-255 steering → servo degrees (75-125)
                 steer_servo = int(steering_out / 255 * (125 - 75) + 75)
-                # map 0-255 throttle → ESC microseconds (1500-1750)
+
+                dt = 0.01
+
+                # gear parameters
+                vmax_g = [0, 20, 35, 50]
+                k_accel = [0, 3.0, 2.0, 1.2] # **FUTURE** making if not in gear speed range will accel much slower
+                engine_brake = [0.5, 1.5, 1.0, 0.7]
+                drag_coeff = 0.02
+
+                # throttle → target speed
+                vel_target = vmax_g[gear] * (throttle_out / 255.0)
+
+                # speed error
+                speed_error = vel_target - vel_cmd
+
+                # acceleration control
+                accel_cmd = speed_error * k_accel[gear]
+
+                # aerodynamic / rolling drag
+                accel_cmd -= vel_cmd * drag_coeff
+
+                # engine braking
+                if throttle_out == 0:
+                    accel_cmd -= engine_brake[gear]
+
+                # integrate velocity
+                vel_cmd += accel_cmd * dt
+
+                # clamp
+                if vel_cmd < 0:
+                    vel_cmd = 0
+
                 match gear:
                     case 1:
-                        thr_us = int(throttle_out / 255 * (1650 - 1500) + 1500)
+                        thr_us = 1500 + (2000 - 1500) * ((vel_cmd - 0) / (100 - 0))
+                        # thr_us = int(throttle_out / 255 * (1650 - 1500) + 1500)
                     case 2:
-                        thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
+                        thr_us = 1500 + (2000 - 1500) * ((vel_cmd - 0) / (100 - 0))
+                        # thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
                     case 3:
-                        thr_us = int(throttle_out / 255 * (1850 - 1500) + 1500)
+                        thr_us = 1500 + (2000 - 1500) * ((vel_cmd - 0) / (100 - 0))
+                        # thr_us = int(throttle_out / 255 * (1850 - 1500) + 1500)
                     case -1:
-                        thr_us = int(1500 - (throttle_out / 255 * (1500 - 1250)))
+                        thr_us = 1500 + (1000 - 1500) * ((vel_cmd - 0) / (100 - 0))
+                        # thr_us = int(1500 - (throttle_out / 255 * (1500 - 1250)))
                     case 0:
-                        thr_us = 1500
-                pkt = struct.pack(CTRL_FMT, thr_us, steer_servo)
+                        thr_us = 1500 + (2000 - 1500) * ((vel_cmd - 0) / (100 - 0))
+                pkt = struct.pack(CTRL_FMT, int(thr_us), steer_servo)
                 with ctrl_lock:
                     ctrl_state["throttle_us"] = thr_us
                     ctrl_state["steer_deg"] = steer_servo
