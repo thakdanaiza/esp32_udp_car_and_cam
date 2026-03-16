@@ -1,25 +1,32 @@
 /*
   JST_CAM_STREAM
-  Lean 720p JPEG streaming over TCP WiFi.
+  Lean VGA JPEG streaming over chunked UDP WiFi.
   No web server, no SD card, no motion detection.
 
   Protocol:
-    PC → ESP32 : 1 byte = JPEG quality (1-63)
-                 Send first time to START stream, send again to change quality
-    ESP32 → PC : [4-byte big-endian length] + [JPEG bytes]  (repeating)
+    PC → ESP32 (UDP port 8080): 1 byte = JPEG quality (1-63)
+    ESP32 → PC (UDP port 8081): chunked frames
+      Each chunk: [2B LE frame_id][1B chunk_index][1B total_chunks][payload]
+      Max payload per chunk ~1400 bytes to fit in one WiFi MTU.
 
-  Board: AI Thinker ESP32-CAM
+  Board: ESP32-S3 CAM
 */
 
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include "esp_camera.h"
 
 // ===== WiFi =====
 const char* WIFI_SSID = "301/3_2.4G";
 const char* WIFI_PASS = "357m19smith";
 
-// ===== TCP =====
-const uint16_t TCP_PORT = 8080;
+// ===== UDP =====
+const uint16_t UDP_CMD_PORT    = 8080;   // receive quality commands
+const uint16_t UDP_STREAM_PORT = 8081;   // send frames to PC
+
+WiFiUDP udp;
+IPAddress pcIP;
+bool pcKnown = false;
 
 // ===== Camera pins (ESP32-S3 CAM Board) =====
 #define CAM_PIN_PWDN    -1
@@ -29,24 +36,25 @@ const uint16_t TCP_PORT = 8080;
 #define CAM_PIN_SIOD    4
 #define CAM_PIN_SIOC    5
 
-#define CAM_PIN_D7      11
-#define CAM_PIN_D6      9
-#define CAM_PIN_D5      8
-#define CAM_PIN_D4      10
-#define CAM_PIN_D3      12
-#define CAM_PIN_D2      18
-#define CAM_PIN_D1      17
-#define CAM_PIN_D0      16
+#define CAM_PIN_D0      11
+#define CAM_PIN_D1      9
+#define CAM_PIN_D2      8
+#define CAM_PIN_D3      10
+#define CAM_PIN_D4      12
+#define CAM_PIN_D5      18
+#define CAM_PIN_D6      17
+#define CAM_PIN_D7      16
 
 #define CAM_PIN_VSYNC   6
 #define CAM_PIN_HREF    7
 #define CAM_PIN_PCLK    13
 
-WiFiServer server(TCP_PORT);
-WiFiClient client;
+bool     streaming   = false;
+uint8_t  jpegQuality = 12;
 
-bool     streaming   = false;  // Start stream after receiving the first quality byte
-uint8_t  jpegQuality = 12;     // default quality
+uint16_t frameId     = 0;
+const uint32_t FRAME_INTERVAL = 40;  // ~25 FPS cap
+uint32_t lastFrameMs = 0;
 
 uint32_t frameCount  = 0;
 uint32_t lastFpsTime = 0;
@@ -76,28 +84,24 @@ bool initCamera() {
   config.pixel_format  = PIXFORMAT_JPEG;
 
   if (psramFound()) {
-    // config.frame_size   = FRAMESIZE_HD;   // 1280x720 — needs PSRAM
-    // config.fb_count     = 3; // was 2
-    // config.grab_mode    = CAMERA_GRAB_LATEST;
-    config.frame_size = FRAMESIZE_SVGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 2;
-    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.frame_size   = FRAMESIZE_VGA;   // 640x480
+    config.jpeg_quality = jpegQuality;
+    config.fb_count     = 3;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
   } else {
-    Serial.println("No PSRAM — falling back to VGA");
-    config.frame_size   = FRAMESIZE_VGA;  // 640x480 — safe without PSRAM
+    Serial.println("No PSRAM — falling back to VGA single buffer");
+    config.frame_size   = FRAMESIZE_VGA;
+    config.jpeg_quality = jpegQuality;
     config.fb_count     = 1;
     config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   }
-
-  config.jpeg_quality  = jpegQuality;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed: 0x%x\n", err);
     return false;
   }
-  Serial.println("Camera OK (1280x720)");
+  Serial.println("Camera OK (VGA 640x480)");
   return true;
 }
 
@@ -107,37 +111,32 @@ void applyQuality(uint8_t q) {
   jpegQuality = q;
   sensor_t* s = esp_camera_sensor_get();
 
-  // addition debug
-  if (s != NULL) {
-    s->set_framesize(s, FRAMESIZE_SVGA);
-  }
-
   if (!s) { Serial.println("Sensor not available"); return; }
   s->set_quality(s, jpegQuality);
   Serial.printf("Quality → %d\n", jpegQuality);
 }
 
-bool sendFrame(WiFiClient& cli, camera_fb_t* fb) {
-  uint32_t len = fb->len;
-  uint8_t header[4] = {
-    (uint8_t)(len >> 24),
-    (uint8_t)(len >> 16),
-    (uint8_t)(len >>  8),
-    (uint8_t)(len      )
-  };
-  if (cli.write(header, 4) != 4) return false;
+const size_t MAX_CHUNK_PAYLOAD = 1400;  // fits in one WiFi MTU
 
-  // Send in TCP-segment-sized chunks to avoid exhausting heap in lwIP buffers
-  const size_t CHUNK = 1460;
-  size_t sent = 0;
-  while (sent < len) {
-    size_t chunk = min((size_t)CHUNK, (size_t)(len - sent));
-    size_t written = cli.write(fb->buf + sent, chunk);
-    if (written == 0) return false;
-    sent += written;
+void sendFrameUDP(camera_fb_t* fb) {
+  uint8_t totalChunks = (fb->len + MAX_CHUNK_PAYLOAD - 1) / MAX_CHUNK_PAYLOAD;
+  if (totalChunks > 255) totalChunks = 255;  // safety clamp
+
+  for (uint8_t i = 0; i < totalChunks; i++) {
+    size_t offset = (size_t)i * MAX_CHUNK_PAYLOAD;
+    size_t len = fb->len - offset;
+    if (len > MAX_CHUNK_PAYLOAD) len = MAX_CHUNK_PAYLOAD;
+
+    udp.beginPacket(pcIP, UDP_STREAM_PORT);
+    uint8_t hdr[4] = {
+      (uint8_t)(frameId & 0xFF), (uint8_t)(frameId >> 8),
+      i, totalChunks
+    };
+    udp.write(hdr, 4);
+    udp.write(fb->buf + offset, len);
+    udp.endPacket();
   }
-  cli.flush();
-  return true;
+  frameId++;
 }
 
 void setup() {
@@ -157,43 +156,39 @@ void setup() {
   }
   Serial.printf("\nWiFi OK. IP: %s\n", WiFi.localIP().toString().c_str());
 
-  server.begin();
-  server.setNoDelay(true);
-  Serial.printf("TCP port %d — waiting for cam_viewer...\n", TCP_PORT);
+  udp.begin(UDP_CMD_PORT);
+  Serial.printf("UDP cmd port %d — waiting for quality byte...\n", UDP_CMD_PORT);
 }
 
 void loop() {
-  // Accept new client
-  if (server.hasClient()) {
-    if (client.connected()) client.stop();
-    client = server.accept();
-    client.setNoDelay(true);
-    streaming  = false;   // Always wait for quality byte first
-    frameCount = 0;
-    lastFpsTime = millis();
-    Serial.printf("Client: %s — waiting for quality byte...\n",
-                  client.remoteIP().toString().c_str());
-  }
-
-  if (!client.connected()) return;
-
-  // Check command from PC (quality byte) — do this before sending each frame
-  if (client.available() > 0) {
-    uint8_t q = client.read();
+  // Check for quality command from PC
+  int pktSize = udp.parsePacket();
+  if (pktSize == 1) {
+    uint8_t q;
+    udp.read(&q, 1);
+    pcIP = udp.remoteIP();
+    pcKnown = true;
     applyQuality(q);
     if (!streaming) {
       streaming = true;
-      Serial.printf("Stream START  quality=%d\n", jpegQuality);
+      frameCount  = 0;
+      lastFpsTime = millis();
+      Serial.printf("Stream START  quality=%d  PC=%s\n",
+                    jpegQuality, pcIP.toString().c_str());
     }
   }
 
-  if (!streaming) return;   // Quality byte not yet received → do not send
+  if (!pcKnown || !streaming) return;
 
-  // Low-heap guard — skip frame rather than crash
+  // FPS cap
+  if (millis() - lastFrameMs < FRAME_INTERVAL) return;
+  lastFrameMs = millis();
+
+  // Low-heap guard
   if (heap_caps_get_free_size(MALLOC_CAP_DEFAULT) < 8000) {
     Serial.printf("[MEM] Low heap: %u bytes — skipping frame\n",
                   heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
-    delay(100);
+    delay(10);
     return;
   }
 
@@ -205,24 +200,15 @@ void loop() {
     return;
   }
 
-  Serial.printf("Frame OK  size=%d\n", fb->len);
-
-  bool ok = sendFrame(client, fb);
+  sendFrameUDP(fb);
   esp_camera_fb_return(fb);
-
-  if (!ok) {
-    Serial.println("Client disconnected.");
-    client.stop();
-    streaming = false;
-    return;
-  }
 
   // FPS log
   frameCount++;
   uint32_t now = millis();
   if (now - lastFpsTime >= 2000) {
-    Serial.printf("FPS: %.1f  quality: %d\n",
-                  frameCount * 1000.0f / (now - lastFpsTime), jpegQuality);
+    Serial.printf("FPS: %.1f  quality: %d  frame_id: %u\n",
+                  frameCount * 1000.0f / (now - lastFpsTime), jpegQuality, frameId);
     frameCount  = 0;
     lastFpsTime = now;
   }

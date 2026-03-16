@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
 cam_viewer.py
-Receives JPEG stream from ESP32 (JST_CAM_STREAM) over TCP.
+Receives JPEG stream from ESP32 (JST_CAM_STREAM) over UDP.
 Displays with OpenCV + trackbar to adjust quality in real-time.
 Press Q to quit.
 
 Protocol:
-  PC → ESP32 : 1 byte = JPEG quality (1-63)
-  ESP32 → PC : [4-byte big-endian length] + [JPEG bytes]
+  PC → ESP32 (UDP port 8080): 1 byte = JPEG quality (1-63), resent every 1s
+  ESP32 → PC (UDP port 8081): chunked frames
+    Each chunk: [2B LE frame_id][1B chunk_index][1B total_chunks][payload]
+
+Architecture:
+  Receiver thread: recvfrom → reassemble chunks → store latest frame → loop
+  Main thread:     grab latest frame → decode → overlay → display → loop
 
 Install: pip install opencv-python numpy
 """
@@ -20,158 +25,160 @@ import cv2
 import time
 
 # ===== Config =====
-ESP32_IP        = "192.168.1.17"  # <-- Enter the IP address of the ESP32
-TCP_PORT        = 8080
+ESP32_IP        = "192.168.1.17"
+UDP_CMD_PORT    = 8080            # send quality commands to ESP32
+UDP_STREAM_PORT = 8081            # receive frames from ESP32
 INIT_QUALITY    = 48              # quality at startup (1=best, 63=worst)
-RECONNECT_DELAY = 2.0
+QUALITY_RESEND  = 1.0             # resend quality every N seconds
 
-WINDOW = "ESP32-CAM 720p  |  Q=quit"
+WINDOW = "ESP32-CAM VGA  |  Q=quit"
 
 # ===== Shared state =====
-sock_lock    = threading.Lock()
-_sock        = None        # global socket ref for sending quality
+frame_lock   = threading.Lock()
+_latest_jpeg = None
+_frame_seq   = 0
 
 last_quality = INIT_QUALITY
-sent_quality = -1          # Prevent resending if value has not changed
-
-
-def send_quality(q: int):
-    """Send quality byte to ESP32 (thread-safe)"""
-    global sent_quality
-    q = max(1, min(63, q))
-    if q == sent_quality:
-        return
-    with sock_lock:
-        if _sock:
-            try:
-                _sock.sendall(bytes([q]))
-                sent_quality = q
-            except Exception:
-                pass
 
 
 def on_trackbar(val):
-    """Callback when trackbar changes"""
     global last_quality
-    last_quality = val
-    send_quality(val)
+    last_quality = max(1, min(63, val))
 
 
-def recv_exact(sock, n):
-    buf = bytearray()
-    while len(buf) < n:
+def receiver_thread(recv_sock, stop_event, drop_counter):
+    """Background thread: receives UDP chunks, reassembles into JPEG frames."""
+    global _latest_jpeg, _frame_seq
+
+    last_frame_id = -1
+    # Reassembly state for current frame
+    cur_frame_id = -1
+    cur_total = 0
+    cur_chunks = {}
+
+    while not stop_event.is_set():
         try:
-            chunk = sock.recv(n - len(buf))
+            data, addr = recv_sock.recvfrom(1500)
+            if len(data) < 5:  # 4-byte header + at least 1 byte payload
+                continue
+
+            frame_id = struct.unpack('<H', data[:2])[0]
+            chunk_idx = data[2]
+            total_chunks = data[3]
+            payload = data[4:]
+
+            # New frame — reset reassembly buffer
+            if frame_id != cur_frame_id:
+                # Count dropped frames
+                if last_frame_id >= 0 and cur_frame_id >= 0:
+                    gap = (frame_id - last_frame_id - 1) & 0xFFFF
+                    if gap > 0:
+                        drop_counter[0] += gap
+                last_frame_id = frame_id
+                cur_frame_id = frame_id
+                cur_total = total_chunks
+                cur_chunks = {}
+
+            cur_chunks[chunk_idx] = payload
+
+            # All chunks received — assemble JPEG
+            if len(cur_chunks) == cur_total:
+                jpeg = b''.join(cur_chunks[i] for i in range(cur_total)
+                                if i in cur_chunks)
+                with frame_lock:
+                    _latest_jpeg = jpeg
+                    _frame_seq += 1
+                cur_chunks = {}  # done with this frame
+
         except socket.timeout:
-            raise ConnectionError("Timeout waiting for data")
-
-        if not chunk:
-            raise ConnectionError("Connection closed")
-
-        buf.extend(chunk)
-    return bytes(buf)
-
-
-def stream_loop(sock):
-    global _sock
-    fps_count = 0
-    fps_time  = time.time()
-    last_fps  = 0.0
-
-    # Send first quality byte → trigger ESP32 to start stream
-    sock.sendall(bytes([last_quality]))
-    print(f"Sent START  quality={last_quality}")
-
-    while True:
-        # Read header
-        print("Waiting frame...")
-        header = recv_exact(sock, 4)
-        print("Header received")
-        size   = struct.unpack('>I', header)[0]
-
-        if size == 0 or size > 300_000:
-            raise ValueError(f"Invalid frame size: {size}")
-
-        # Read JPEG
-        jpeg = recv_exact(sock, size)
-
-        # Decode
-        arr = np.frombuffer(jpeg, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if len(jpeg) < 1000:
             continue
-        if img is None:
-            continue
-
-        # FPS
-        fps_count += 1
-        now = time.time()
-        if now - fps_time >= 1.0:
-            last_fps  = fps_count / (now - fps_time)
-            fps_count = 0
-            fps_time  = now
-
-        # Overlay
-        q = cv2.getTrackbarPos("Quality (1=best)", WINDOW)
-        cv2.putText(img, f"FPS: {last_fps:.1f}   Q: {q}",
-                    (10, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2)
-
-        cv2.imshow(WINDOW, img)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            return False
-
-    return True
+        except Exception:
+            if not stop_event.is_set():
+                break
 
 
 def main():
-    global _sock, sent_quality
+    global _latest_jpeg, _frame_seq
 
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW, 1280, 760)
-
-    # Trackbar: 1 (sharpest / large file) → 63 (blurry / small file / high FPS)
+    cv2.resizeWindow(WINDOW, 960, 720)
     cv2.createTrackbar("Quality (1=best)", WINDOW, INIT_QUALITY, 63, on_trackbar)
 
-    print(f"Connecting to {ESP32_IP}:{TCP_PORT} ...")
+    # UDP sockets
+    cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    recv_sock.bind(("", UDP_STREAM_PORT))
+    recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+    recv_sock.settimeout(1.0)
 
-    while True:
-        s = None
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5.0)
-            s.connect((ESP32_IP, TCP_PORT))
-            s.settimeout(None)
-            print(f"Connected  {ESP32_IP}:{TCP_PORT}")
+    drop_counter = [0]  # mutable container for thread access
+    stop_event = threading.Event()
+    recv_t = threading.Thread(
+        target=receiver_thread, args=(recv_sock, stop_event, drop_counter), daemon=True
+    )
+    recv_t.start()
 
-            with sock_lock:
-                _sock = s
-            sent_quality = -1   # reset so it sends again
+    fps_count    = 0
+    fps_time     = time.time()
+    last_fps     = 0.0
+    last_seq     = 0
+    last_img     = None
+    last_send    = 0.0
 
-            keep = stream_loop(s)
+    print(f"Streaming from {ESP32_IP} — UDP cmd:{UDP_CMD_PORT} stream:{UDP_STREAM_PORT}")
 
-            with sock_lock:
-                _sock = None
-            s.close()
+    try:
+        while True:
+            # Periodic quality resend (covers startup + UDP loss)
+            now = time.time()
+            if now - last_send >= QUALITY_RESEND:
+                q = last_quality
+                cmd_sock.sendto(bytes([max(1, min(63, q))]), (ESP32_IP, UDP_CMD_PORT))
+                last_send = now
 
-            if not keep:
+            # Grab latest frame
+            with frame_lock:
+                jpeg = _latest_jpeg
+                seq  = _frame_seq
+
+            if seq != last_seq and jpeg is not None:
+                last_seq = seq
+                arr = np.frombuffer(jpeg, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    last_img = img
+                    fps_count += 1
+
+            if last_img is None:
+                key = cv2.waitKey(10) & 0xFF
+                if key == ord('q'):
+                    break
+                continue
+
+            # FPS calc
+            if now - fps_time >= 1.0:
+                last_fps  = fps_count / (now - fps_time)
+                fps_count = 0
+                fps_time  = now
+
+            # Overlay
+            q = cv2.getTrackbarPos("Quality (1=best)", WINDOW)
+            cv2.putText(last_img, f"FPS: {last_fps:.1f}  Q: {q}  drops: {drop_counter[0]}",
+                        (10, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+            cv2.imshow(WINDOW, last_img)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
 
-        except KeyboardInterrupt:
-            print("\nStopped.")
-            break
-        except Exception as e:
-            with sock_lock:
-                _sock = None
-            print(f"Error: {e}  — reconnecting in {RECONNECT_DELAY}s ...")
-            if s is not None:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-            time.sleep(RECONNECT_DELAY)
-
-    cv2.destroyAllWindows()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        stop_event.set()
+        recv_t.join(timeout=2.0)
+        cmd_sock.close()
+        recv_sock.close()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
