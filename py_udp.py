@@ -70,7 +70,7 @@ def tele_recv_thread(sock, relay_sock):
                     tele_data["turns"] = vals[8]
                 try:
                     with ctrl_lock:
-                        thr = ctrl_state["throttle_us"]
+                        thr   = ctrl_state["throttle_us"]
                         steer = ctrl_state["steer_deg"]
                     relay_pkt = data + struct.pack('<hh', thr, steer)
                     relay_sock.sendto(relay_pkt, ("127.0.0.1", DASHBOARD_PORT))
@@ -133,6 +133,8 @@ def read_device(device_info, ctrl_sock):
     last_serial_send = 0
     steering_out     = 127
     throttle_out     = 0
+    gear = 0
+    left_flag, right_flag, N_flag, R_flag = 0, 0, 0, 0
 
     try:
         while True:
@@ -155,10 +157,46 @@ def read_device(device_info, ctrl_sock):
                 else:
                     throttle = brake = 0
 
+                # Parse gearing buttons (1-bit)
+                if len(data) >= 21:
+                    paddle_left  = (data[19] >> 0) & 1
+                    paddle_right = (data[19] >> 1) & 1
+                    N_button     = (data[19] >> 6) & 1
+                    R_button     = (data[21] >> 6) & 1
+                    
+                    
+
                 # Normalize to 0-255
                 s_range = steering_max - steering_min
                 steering_out = int(max(0.0, min(1.0, (steering - steering_min) / s_range)) * 255) if s_range else 127
                 throttle_out = int((throttle / 65535) * 255)
+                brake_out    = int((brake / 65535) * 255)
+
+                # gear functioning
+                if gear == 0: throttle_out = 0
+                if paddle_left and not left_flag:
+                    left_flag = 1
+                    if gear > 0:
+                        gear -= 1
+                if not paddle_left and left_flag:
+                    left_flag = 0
+
+                if paddle_right and not right_flag:
+                    right_flag = 1
+                    if gear < 3:
+                        if R_flag:
+                            R_flag = 0
+                            gear = 0
+                        gear += 1
+                if not paddle_right and right_flag:
+                    right_flag = 0
+
+                if N_button and not N_flag:
+                    gear = 0
+
+                if R_button and gear == 0:
+                    R_flag = 1
+                    gear = -1
 
                 # Redraw display (16 lines)
                 sys.stdout.write('\033[16F')
@@ -168,28 +206,36 @@ def read_device(device_info, ctrl_sock):
                 with tele_lock:
                     t = dict(tele_data)
 
-                print("┌" + "─" * 78 + "┐")
-                print(f"│  STEERING  {draw_steering_bar(steering, steering_min, steering_max):64} │")
-                print(f"│  Raw: {steering:12d}                                                            │")
-                print("│" + " " * 78 + "│")
-                print(f"│  {draw_pedal_bar(throttle, 65535, 'THROTTLE'):74} │")
-                print(f"│  {draw_pedal_bar(brake,    65535, 'BRAKE'):74} │")
-                print("│" + " " * 78 + "│")
-                print(f"│  UDP TX → {ESP32_IP}:{UDP_CTRL_PORT}   <steer={steering_out},thr={throttle_out}>                     │")
-                print("│" + " " * 78 + "│")
+                print("┌" + "─" * 85 + "┐")
+                print(f"│  STEERING  {draw_steering_bar(steering, steering_min, steering_max):64}      │")
+                print(f"│  Raw: {steering:12d}                                                                  │")
+                print("│" + " " * 85 + "│")
+                print(f"│  {draw_pedal_bar(throttle, 65535, 'THROTTLE'):74}         │")
+                print(f"│  {draw_pedal_bar(brake,    65535, 'BRAKE'):74}         │")
+                print("│" + " " * 85 + "│")
+                print(f"│  UDP TX → {ESP32_IP}:{UDP_CTRL_PORT} <gear = [{gear}]> <str={steering_out},thr={throttle_out},brk={brake_out},pL={paddle_left},pR={paddle_right},N={N_button},R={R_button}>    │")
+                print("│" + " " * 85 + "│")
                 print(f"│  IMU  A [{t['ax']:6.2f} {t['ay']:6.2f} {t['az']:6.2f}]"
-                      f"  G [{t['gx']:6.2f} {t['gy']:6.2f} {t['gz']:6.2f}]                │")
-                print(f"│  ENC  deg={t['angle']:6.1f}  omega={t['omega']:7.1f} deg/s  turns={t['turns']:6d}                   │")
-                print("│" + " " * 78 + "│")
-                print(f"│  Raw bytes: {raw_disp:64} │")
-                print("└" + "─" * 78 + "┘")
+                      f"  G [{t['gx']:6.2f} {t['gy']:6.2f} {t['gz']:6.2f}]                            │")
+                print(f"│  ENC  deg={t['angle']:6.1f}  omega={t['omega']:7.1f} deg/s  turns={t['turns']:6d}                                 │")
+                # print("│" + " " * 85 + "│")
+                # print(f"│  Raw bytes: {raw_disp:64} │")
+                print("└" + "─" * 85 + "┘")
 
             # Send ControlPacket every 50ms
             if (current_ms - last_serial_send) >= 50:
                 # map 0-255 steering → servo degrees (75-125)
                 steer_servo = int(steering_out / 255 * (125 - 75) + 75)
                 # map 0-255 throttle → ESC microseconds (1500-1750)
-                thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
+                match gear:
+                    case 1:
+                        thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
+                    case 2:
+                        thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
+                    case 3:
+                        thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
+                    case -1:
+                        thr_us = int(1500 - (throttle_out / 255 * (1500 - 1250)))
                 pkt = struct.pack(CTRL_FMT, thr_us, steer_servo)
                 with ctrl_lock:
                     ctrl_state["throttle_us"] = thr_us
