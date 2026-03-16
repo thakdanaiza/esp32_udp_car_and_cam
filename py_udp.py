@@ -229,11 +229,11 @@ def read_device(device_info, ctrl_sock):
                 # map 0-255 throttle → ESC microseconds (1500-1750)
                 match gear:
                     case 1:
-                        thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
+                        thr_us = int(throttle_out / 255 * (1650 - 1500) + 1500)
                     case 2:
                         thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
                     case 3:
-                        thr_us = int(throttle_out / 255 * (1750 - 1500) + 1500)
+                        thr_us = int(throttle_out / 255 * (1850 - 1500) + 1500)
                     case -1:
                         thr_us = int(1500 - (throttle_out / 255 * (1500 - 1250)))
                     case 0:
