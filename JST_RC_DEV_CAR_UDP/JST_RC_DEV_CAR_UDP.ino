@@ -62,8 +62,8 @@ bool      pcKnown  = false;
 
 uint32_t lastTx    = 0;
 uint32_t lastPrint = 0;
-const uint32_t TX_INTERVAL    = 50;
-const uint32_t PRINT_INTERVAL = 200;
+const uint32_t TX_INTERVAL    = 40;
+const uint32_t PRINT_INTERVAL = 100;
 
 // ===== AS5600 init =====
 static void as5600Init() {
