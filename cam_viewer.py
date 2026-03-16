@@ -84,9 +84,7 @@ def stream_loop(sock):
 
     while True:
         # Read header
-        print("Waiting frame...")
         header = recv_exact(sock, 4)
-        print("Header received")
         size   = struct.unpack('>I', header)[0]
 
         if size == 0 or size > 300_000:
@@ -96,10 +94,10 @@ def stream_loop(sock):
         jpeg = recv_exact(sock, size)
 
         # Decode
-        arr = np.frombuffer(jpeg, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if len(jpeg) < 1000:
             continue
+        arr = np.frombuffer(jpeg, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             continue
 

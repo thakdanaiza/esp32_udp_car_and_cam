@@ -29,14 +29,14 @@ const uint16_t TCP_PORT = 8080;
 #define CAM_PIN_SIOD    4
 #define CAM_PIN_SIOC    5
 
-#define CAM_PIN_D7      11
-#define CAM_PIN_D6      9
-#define CAM_PIN_D5      8
-#define CAM_PIN_D4      10
-#define CAM_PIN_D3      12
-#define CAM_PIN_D2      18
-#define CAM_PIN_D1      17
-#define CAM_PIN_D0      16
+#define CAM_PIN_D0      11
+#define CAM_PIN_D1      9
+#define CAM_PIN_D2      8
+#define CAM_PIN_D3      10
+#define CAM_PIN_D4      12
+#define CAM_PIN_D5      18
+#define CAM_PIN_D6      17
+#define CAM_PIN_D7      16
 
 #define CAM_PIN_VSYNC   6
 #define CAM_PIN_HREF    7
@@ -97,7 +97,7 @@ bool initCamera() {
     Serial.printf("Camera init failed: 0x%x\n", err);
     return false;
   }
-  Serial.println("Camera OK (1280x720)");
+  Serial.println("Camera OK (SVGA 800x600)");
   return true;
 }
 
@@ -106,11 +106,6 @@ void applyQuality(uint8_t q) {
   if (q == jpegQuality) return;
   jpegQuality = q;
   sensor_t* s = esp_camera_sensor_get();
-
-  // addition debug
-  if (s != NULL) {
-    s->set_framesize(s, FRAMESIZE_SVGA);
-  }
 
   if (!s) { Serial.println("Sensor not available"); return; }
   s->set_quality(s, jpegQuality);
@@ -204,8 +199,6 @@ void loop() {
     delay(10);
     return;
   }
-
-  Serial.printf("Frame OK  size=%d\n", fb->len);
 
   bool ok = sendFrame(client, fb);
   esp_camera_fb_return(fb);
