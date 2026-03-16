@@ -71,10 +71,19 @@ bool initCamera() {
 
   config.xclk_freq_hz  = 20000000;
   config.pixel_format  = PIXFORMAT_JPEG;
-  config.frame_size    = FRAMESIZE_HD;    // 1280x720
+
+  if (psramFound()) {
+    config.frame_size   = FRAMESIZE_HD;   // 1280x720 — needs PSRAM
+    config.fb_count     = 2;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
+  } else {
+    Serial.println("No PSRAM — falling back to VGA");
+    config.frame_size   = FRAMESIZE_VGA;  // 640x480 — safe without PSRAM
+    config.fb_count     = 1;
+    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  }
+
   config.jpeg_quality  = jpegQuality;
-  config.fb_count      = 2;
-  config.grab_mode     = CAMERA_GRAB_LATEST;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -90,6 +99,7 @@ void applyQuality(uint8_t q) {
   if (q == jpegQuality) return;
   jpegQuality = q;
   sensor_t* s = esp_camera_sensor_get();
+  if (!s) { Serial.println("Sensor not available"); return; }
   s->set_quality(s, jpegQuality);
   Serial.printf("Quality → %d\n", jpegQuality);
 }
@@ -102,8 +112,18 @@ bool sendFrame(WiFiClient& cli, camera_fb_t* fb) {
     (uint8_t)(len >>  8),
     (uint8_t)(len      )
   };
-  if (cli.write(header, 4) != 4)       return false;
-  if (cli.write(fb->buf, len) != len)  return false;
+  if (cli.write(header, 4) != 4) return false;
+
+  // Send in TCP-segment-sized chunks to avoid exhausting heap in lwIP buffers
+  const size_t CHUNK = 1460;
+  size_t sent = 0;
+  while (sent < len) {
+    size_t chunk = min((size_t)CHUNK, (size_t)(len - sent));
+    size_t written = cli.write(fb->buf + sent, chunk);
+    if (written == 0) return false;
+    sent += written;
+  }
+  cli.flush();
   return true;
 }
 
@@ -155,6 +175,14 @@ void loop() {
   }
 
   if (!streaming) return;   // Quality byte not yet received → do not send
+
+  // Low-heap guard — skip frame rather than crash
+  if (heap_caps_get_free_size(MALLOC_CAP_DEFAULT) < 20000) {
+    Serial.printf("[MEM] Low heap: %u bytes — skipping frame\n",
+                  heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+    delay(50);
+    return;
+  }
 
   // Capture + send
   camera_fb_t* fb = esp_camera_fb_get();
